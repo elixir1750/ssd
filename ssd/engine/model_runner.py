@@ -9,6 +9,7 @@ from transformers import AutoTokenizer, AutoConfig
 import os
 import flashinfer
 from ssd.config import Config
+from ssd.utils.distributed import init_model_parallel, create_async_group
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
@@ -96,15 +97,7 @@ class ModelRunner:
         self.tp_pg = None 
 
         if should_use_dist: 
-            default_port = 1223 
-            dist.init_process_group(
-                "nccl", f"tcp://localhost:{default_port}",
-                world_size=self.world_size,
-                rank=self.rank,
-                device_id=self.device,
-            )
-
-            self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
+            self.tp_pg = init_model_parallel(config, self.rank, self.num_tp_gpus, self.device)
 
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.hf_config.torch_dtype)
@@ -121,7 +114,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.config.draft_async:
+        if self.config.draft_async and not self.config.use_dflash:
             if self.config.fan_out_list is None:
                 self.config.fan_out_list = [
                     self.config.async_fan_out] * (self.config.speculate_k + 1)
@@ -134,7 +127,7 @@ class ModelRunner:
             self.config.MQ_LEN = sum(self.config.fan_out_list)
             print(f'F={self.config.async_fan_out}, fan_out_list={self.config.fan_out_list}, fan_out_list_miss={self.config.fan_out_list_miss}, MQ_LEN={self.config.MQ_LEN}', flush=True)
 
-        if should_use_dist: # (draft model when async=False or just single gpu logic) doesn't even enter this loop 
+        if should_use_dist and not config.use_dflash:  # Legacy TP / AR-draft worker loop
             if self.is_draft and self.draft_async: 
                 pass # handled on draft runner after this init, includes doing draft_loop
             elif self.rank == 0: # target in a distributed setup 
@@ -256,7 +249,7 @@ class ModelRunner:
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
+            self.async_pg = create_async_group(config)
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
@@ -394,7 +387,7 @@ class ModelRunner:
         Best-effort: send cmd=2 to draft (async_pg) from TARGET rank 0.
         Safe to call multiple times.
         """
-        if not (self.draft_async and not self.is_draft and self.rank == 0):
+        if self.config.use_dflash or not (self.draft_async and not self.is_draft and self.rank == 0):
             return
         try:
             cmd = torch.tensor([2], dtype=torch.int64, device=self.device)

@@ -76,8 +76,8 @@ def branch_prefix_cache(context_cache, block_kv, keep_self_positions):
 
 
 class DFlashPositionsRunner(DFlashRunner):
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, device=None, reserve_target=True):
+        super().__init__(config, device=device, reserve_target=reserve_target)
         dc, k = config.draft_hf_config, config.speculate_k
         element_size = next(self.model.parameters()).element_size()
         per_position = 2 * dc.num_hidden_layers * dc.num_key_value_heads * dc.head_dim
@@ -85,8 +85,9 @@ class DFlashPositionsRunner(DFlashRunner):
         # Account for temporary torch.cat copies while building a branch prefix.
         cache_bytes = per_position * (3 * config.max_model_len + (k + 1) * (k + 3)) * element_size
         proposal_bytes = (k + 2) * k * dc.vocab_size * 4  # q is always float32
-        self._positions_reservation = torch.empty(cache_bytes + proposal_bytes,
-                                                  dtype=torch.uint8, device=self.device)
+        self._positions_reservation = (torch.empty(cache_bytes + proposal_bytes,
+                                                   dtype=torch.uint8, device=self.device)
+                                       if reserve_target else None)
 
     def bind_target(self, target):
         super().bind_target(target)

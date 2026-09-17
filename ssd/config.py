@@ -25,6 +25,8 @@ class Config:
     draft: str = DEFAULT_DRAFT
     speculate_k: int = 1
     draft_async: bool = False
+    distributed_init_method: str = "tcp://localhost:1223"
+    distributed_timeout_seconds: float = 180.0
     
     # async spec only
     async_fan_out: int = 3
@@ -57,10 +59,17 @@ class Config:
         if self.dflash_all_positions and not self.use_dflash:
             raise ValueError("dflash_all_positions requires use_dflash=True")
         if self.use_dflash:
-            if self.draft_async or self.use_eagle or self.num_gpus != 1 or self.max_num_seqs != 1:
-                raise ValueError("DFlash baseline requires synchronous mode, one GPU, max_num_seqs=1, use_eagle=False")
+            expected_gpus = 2 if self.draft_async else 1
+            if self.use_eagle or self.num_gpus != expected_gpus or self.max_num_seqs != 1:
+                raise ValueError("DFlash requires one request, no EAGLE, and one GPU (sync) or two GPUs (async)")
+            if self.draft_async and not self.dflash_all_positions:
+                raise ValueError("Async DFlash requires dflash_all_positions=True")
+            if self.distributed_timeout_seconds <= 0:
+                raise ValueError("distributed_timeout_seconds must be positive")
             if self.sampler_x is not None or self.speculate_k < 1:
                 raise ValueError("DFlash requires speculate_k >= 1 and no sampler_x rescaling")
+            if self.kvcache_block_size < 2 * self.speculate_k + 2:
+                raise ValueError("DFlash requires kvcache_block_size >= 2 * speculate_k + 2")
             self.speculate = True
             self.enforce_eager = True
         model = self.model
@@ -75,7 +84,7 @@ class Config:
             self.draft_hf_config = AutoConfig.from_pretrained(draft)
             self.max_model_len = min(
                 self.max_model_len, self.draft_hf_config.max_position_embeddings)
-            if self.draft_async:
+            if self.draft_async and not self.use_dflash:
                 if self.fan_out_list is None: 
                     self.fan_out_list = [self.async_fan_out] * (self.speculate_k + 1)
                     self.MQ_LEN = sum(self.fan_out_list)

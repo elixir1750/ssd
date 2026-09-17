@@ -2,9 +2,10 @@
 
 This experiment prepares the next DFlash proposal for **every `k = 0..K`**
 before the target verifies the current `K` candidates. It keeps the true bonus
-and does not guess or enumerate it. The implementation is a **single-GPU serial
-execution reference**, not a two-GPU asynchronous speedup implementation. Both
-the branch forwards and the target forward run sequentially in this version.
+and does not guess or enumerate it. The default implementation is a **single-GPU serial execution reference**.
+With `--draft-async`, SSD runs the target on GPU 0 and all-position drafting on
+GPU 1, overlapping branch preparation with current target verification.
+Real-model NCCL correctness and speedup still require GPU validation.
 
 The native target attention, argmax rules, verification and numeric reference
 thresholds are unchanged. The previously observed native-target AR/block kernel
@@ -31,7 +32,8 @@ eight new candidates, use `--block-size 9`. Run the same command without
 sampling and separate draft temperature use the same exact-rejection routine.
 
 Python API: add `dflash_all_positions=True` alongside `use_dflash=True`.
-The mode still requires one GPU, one active request and eager execution.
+The serial mode requires one GPU; the async mode requires exactly two GPUs.
+Both modes require one active request and eager execution.
 
 ## A round, with positions made explicit
 
@@ -111,8 +113,10 @@ The JSON report contains:
 
 `mean_accepted` excludes the known anchor. These are measurements of selected
 proposals under the native target, not counterfactual acceptance of every branch
-or proof of equivalence to the HF reference. Serial preparation time is actual
-overhead here and must not be reported as hidden latency or an SSD speedup.
+or proof of equivalence to the HF reference. Serial preparation time is actual overhead and must not be reported as hidden
+latency. Async rounds additionally record `branch_wait_ms`, the target's host
+wait for draft completion after verification. This is not itself a GPU overlap
+measurement or a speedup claim.
 
 There are up to K+1 draft forwards per preparation and O(K²) saved candidate
 positions. Full FP32 q storage costs O(K² × vocabulary size); start with a small
@@ -132,6 +136,86 @@ after bonus/feature arrival; stale proposal rejection; EOS/context/output limits
 and repeated end-to-end rounds with a tiny real draft and deterministic target
 fixture. Baseline tests and the optional pinned-upstream forward check also run.
 
-Real-model acceptance, native CUDA behavior and memory requirements remain to be
-measured on the server. A later implementation can overlap this preparation
-with target verification on a separate device after this data flow is validated.
+Real-model acceptance, native CUDA/NCCL behavior and memory requirements remain
+to be measured on the server. CPU/Gloo tests exercise the actual spawned worker,
+real tiny DFlash and HF target, all selected positions, frozen FP32 q transport,
+multiple requests and terminal slots, stale messages, worker errors and timeouts.
+A gated worker test verifies that target work can proceed while preparation is
+outstanding; this does not establish CUDA kernel overlap or GPU performance.
+
+## Two-GPU SSD execution
+
+```bash
+python -O bench/dflash.py \
+  --target /path/to/Qwen3-target \
+  --draft /path/to/matching-original-DFlash \
+  --all-positions --draft-async --block-size 8 \
+  --max-new-tokens 128 --temperature 0 \
+  --output results/dflash-two-gpu.json
+```
+
+API: `LLM(target, draft=draft, use_dflash=True, dflash_all_positions=True,
+ draft_async=True, num_gpus=2, max_num_seqs=1, speculate_k=7)`.
+Launch the script normally: `LLMEngine` spawns rank 1, as in SSD's existing
+async engine. Do not launch two copies with `torchrun`.
+
+Rank 0 reuses `ModelRunner.run_dflash_target`, the target paged KV pool,
+`DFlashScheduler`, `DFlashStep` and exact p/q rejection sampling. Rank 1 runs
+`DFlashPositionsRunner`. It receives immutable copies of target embedding and
+LM-head weights once during initialization (tied weights share one allocation).
+It owns canonical draft context and all proxy branches. The full target model
+is not loaded on rank 1.
+
+Both ranks use SSD's target TP / target-draft NCCL group layout and tensor
+transport. A local pipe carries command IDs, request metadata, completion and
+errors; candidates, FP32 q and accepted features travel directly over NCCL.
+The per-engine file rendezvous is local, avoiding collisions on a fixed TCP port.
+No target feature from the current verification enters preparation of its next
+branches. Only the selected branch survives, with its original q.
+
+Round order:
+
+1. Receive current candidates/q from rank 1.
+2. Start rank-1 branch preparation without waiting for completion.
+3. Verify the current block and run rejection sampling on rank 0.
+4. Wait for remaining preparation, select the accepted-position branch and send
+   only accepted target features to rank 1.
+5. Refresh canonical context before consuming the saved next proposal.
+
+The first proposal is bootstrapped; the final anchor-only step bypasses drafting.
+Both EOS and output/context limits reset remote state before another request.
+Call `llm.exit(hard=False)` in a `finally` block: shutdown drains pending work,
+reaps the owned child and closes process groups. Worker errors and stale protocol
+messages fail the request; `distributed_timeout_seconds` bounds control and
+process-group waits (default 180 seconds). Failure does not silently fall back
+to a different sampler.
+
+All acceptance-position forwards still execute sequentially **on the draft
+card**. Preparing K+1 branches may exceed target verification time; the target
+then waits. End-to-end performance must include weight/features/q transfers,
+branch preparation and waiting. Compare against both AR and serial FDFlash.
+The known native single-token/block numerical differences remain unchanged.
+
+GPU regression entry point:
+
+```bash
+python bench/verify_dflash_dual.py --target /path/to/Qwen3-target \
+  --draft /path/to/matching-original-DFlash --block-size 8 \
+  --output results/fdflash-dual.json
+```
+
+It runs ordinary single-GPU DFlash, serial FDFlash and async FDFlash in separate
+processes, checks five serial/async greedy
+outputs for exact equality, and exercises two positive-temperature settings,
+request resets, page crossing, one-token output and the context limit. Sampling
+cases test execution only. All results are persisted and failures exit nonzero;
+existing output files are not overwritten. Performance uses three fixed prompts,
+128 output tokens (`ignore_eos=True`), one full-length warmup per prompt and
+three measured repeats. Request wall time includes prefill, transfers, drafting,
+verification, sampling and reset. Initialization/warmups are reported separately.
+Aggregate throughput uses total tokens divided by the sum of per-prompt median
+latencies; output differences between modes are reported explicitly. A passed comparison would establish
+serial/async parity for those cases, not native AR or HF equivalence.
+
+Local validation for this implementation: 23 CPU tests passed, including the
+optional pinned-upstream parity test. GPU validation is pending.

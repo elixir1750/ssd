@@ -57,7 +57,7 @@ class LLMEngine:
             assert target_family == draft_family, f"ERROR: target model family and draft model family must match"
 
         self.dflash_runner = None
-        if config.use_dflash:
+        if config.use_dflash and not config.draft_async:
             from ssd.engine.dflash_sync import DFlashRunner
             if config.dflash_all_positions:
                 from ssd.engine.dflash_positions import DFlashPositionsRunner
@@ -70,6 +70,9 @@ class LLMEngine:
 
         ctx = mp.get_context("spawn")
         self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - 1
+        if config.use_dflash and config.draft_async:
+            self._init_dflash_async(ctx)
+            return
 
         if config.speculate and config.draft_async:
             self.draft_ps = None
@@ -138,14 +141,75 @@ class LLMEngine:
         self._exiting = False
         atexit.register(lambda: self.exit(hard=True))
 
+    def _init_dflash_async(self, ctx):
+        """Reuse SSD's target ModelRunner and async group; replace only the draft worker."""
+        import tempfile
+        import torch
+        import torch.distributed as dist
+        from ssd.engine.dflash_async import DFlashAsyncClient, run_dflash_worker
+        from ssd.engine.dflash_sync import DFlashScheduler
+
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("Async DFlash requires two visible CUDA devices")
+        config = self.config
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        config.eos = self.tokenizer.eos_token_id
+        # A per-engine rendezvous avoids the legacy fixed TCP port and does not
+        # require an external launcher. Both spawned ranks share this local path.
+        self._dflash_rendezvous = tempfile.TemporaryDirectory(prefix="ssd-dflash-dist-")
+        config.distributed_init_method = "file://" + self._dflash_rendezvous.name + "/store"
+        connection, child_connection = ctx.Pipe()
+        self.draft_ps = ctx.Process(target=run_dflash_worker,
+                                   args=(config, 1, child_connection, torch.initial_seed()))
+        default_dtype, default_device = torch.get_default_dtype(), torch.get_default_device()
+        try:
+            self.draft_ps.start()
+            child_connection.close()
+            self.model_runner = ModelRunner(config, 0, self.events, is_draft=False, num_tp_gpus=1)
+            self.dflash_runner = DFlashAsyncClient(config, connection, self.draft_ps,
+                                                   self.model_runner.async_pg, self.model_runner.device)
+            self.dflash_runner.bind_target(self.model_runner.model)
+            self.scheduler = DFlashScheduler(config)
+        except BaseException:
+            connection.close()
+            child_connection.close()
+            if self.draft_ps.pid is not None:
+                if self.draft_ps.is_alive():
+                    self.draft_ps.terminate()
+                self.draft_ps.join(timeout=5)
+                if self.draft_ps.is_alive():
+                    self.draft_ps.kill()
+                    self.draft_ps.join(timeout=5)
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            self._dflash_rendezvous.cleanup()
+            raise
+        finally:
+            torch.set_default_device(default_device)
+            torch.set_default_dtype(default_dtype)
+        self._exiting = False
+        atexit.register(lambda: self.exit(hard=False))
+        print("[LLMEngine] FDFlash target rank 0 / draft rank 1 initialized", flush=True)
+
     def exit(self, hard: bool = True):
         print(f"[LLMEngine] Exiting (hard={hard})", flush=True)
         if getattr(self, "_exiting", False):
             return
         self._exiting = True
         if self.config.use_dflash:
-            # This stage has no child processes or distributed groups.
-            self.dflash_runner.reset()
+            if self.config.draft_async:
+                try:
+                    self.dflash_runner.shutdown()
+                finally:
+                    try:
+                        self.model_runner.exit(hard=False)
+                    finally:
+                        try:
+                            self.dflash_runner.join()
+                        finally:
+                            self._dflash_rendezvous.cleanup()
+            else:
+                self.dflash_runner.reset()
             return
         # 1) If async, tell draft to quit before tearing down anything
         try:

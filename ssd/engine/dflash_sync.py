@@ -20,9 +20,9 @@ from ssd.models.dflash import DFlashDraftModel
 
 
 class DFlashRunner:
-    def __init__(self, config):
+    def __init__(self, config, device=None, reserve_target=True):
         self.config = config
-        self.device = torch.device("cuda:0")
+        self.device = torch.device("cuda:0" if device is None else device)
         dtype = config.hf_config.torch_dtype or torch.bfloat16
         self.model, info = DFlashDraftModel.from_pretrained(
             config.draft, torch_dtype=dtype, output_loading_info=True,
@@ -38,7 +38,12 @@ class DFlashRunner:
         length = config.max_model_len + config.speculate_k + 1
         kv_elements = 2 * dc.num_hidden_layers * dc.num_key_value_heads * dc.head_dim * length
         feature_elements = config.max_model_len * dc.hidden_size * len(config.dflash_target_layers)
-        self._reservation = torch.empty(kv_elements + feature_elements, device=self.device, dtype=dtype)
+        self._reservation = (torch.empty(kv_elements + feature_elements, device=self.device, dtype=dtype)
+                             if reserve_target else None)
+
+    @property
+    def vocab_size(self):
+        return self.model.config.vocab_size
 
     def bind_target(self, target):
         self.target = target
@@ -168,13 +173,12 @@ class DFlashStep:
             candidates, q = self.draft.propose(seq, k)
         else:
             candidates = torch.empty(0, dtype=torch.long, device=self.draft.device)
-            q = torch.empty(0, self.draft.model.config.vocab_size, device=self.draft.device)
+            q = torch.empty(0, self.draft.vocab_size, device=self.draft.device)
         round_record = None
         if k and hasattr(self.draft, "prepare_branches"):
             # Intentionally before target verification: branch inputs cannot
             # include this round's accepted length, bonus, or target features.
             self.draft.prepare_branches(seq, candidates)
-            round_record = dict(self.draft.round_record)
         anchor = seq.recovery_token_id
         old_len, old_last = seq.num_tokens, seq.last_token
         try:
@@ -191,6 +195,10 @@ class DFlashStep:
         finally:
             del seq.token_ids[old_len:]
             seq.num_tokens, seq.last_token = old_len, old_last
+        if k and hasattr(self.draft, "prepare_branches"):
+            if hasattr(self.draft, "finish_branches"):
+                self.draft.finish_branches()
+            round_record = dict(self.draft.round_record)
         produced = self.scheduler.commit(seq, [anchor] + candidates[:accepted].tolist(), bonus)
         if seq.is_finished:
             self.draft.reset()

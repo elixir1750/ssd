@@ -1,7 +1,8 @@
 # Standard DFlash baseline in SSD
 
 For the optional next-stage experiment, see [DFlash for every acceptance
-position](dflash-positions.md), enabled with `--all-positions`. The default mode
+position](dflash-positions.md), enabled with `--all-positions`; add `--draft-async`
+for two-GPU SSD execution. The default mode
 described below remains the standard synchronous baseline.
 
 This stage connects **original DFlash** to SSD's native dense Qwen3 target.
