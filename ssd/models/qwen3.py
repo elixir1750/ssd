@@ -253,12 +253,24 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        target_layer_ids: list[int] | None = None,
     ) -> torch.Tensor:
+        selected = {}
+        wanted = set(target_layer_ids or [])
         hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
         residual = None
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if index in wanted:
+                # HF hidden_states[index + 1] is the full post-layer residual,
+                # whereas SSD defers this addition until the next RMSNorm.
+                selected[index] = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if target_layer_ids is not None:
+            # HF replaces the final layer output with the final normalized state.
+            if len(self.layers) - 1 in wanted:
+                selected[len(self.layers) - 1] = hidden_states
+            return hidden_states, torch.cat([selected[i] for i in target_layer_ids], dim=-1)
         return hidden_states
 
 
@@ -312,8 +324,9 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        target_layer_ids: list[int] | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
+        hidden_states = self.model(input_ids, positions, target_layer_ids=target_layer_ids)
         return hidden_states
 
     def compute_logits(

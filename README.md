@@ -71,6 +71,12 @@ python scripts/get_data_from_hf.py --num-samples 10000
 
 ## Usage
 
+### Experimental synchronous DFlash baseline
+
+Original DFlash can be used with the native dense Qwen3 target in single-GPU,
+single-request eager mode. See [DFlash integration and reference checks](docs/dflash.md).
+This path establishes the standard DFlash baseline before adding asynchronous SSD.
+
 All commands below run from inside the `bench/` directory. Large models (Llama-3 70B, Qwen-3 32B) take a few minutes for load/warmup/compile before generation starts. Always use `python -O` to disable debug overhead.
 
 ### Benchmarks

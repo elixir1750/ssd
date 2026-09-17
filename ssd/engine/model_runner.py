@@ -516,9 +516,10 @@ class ModelRunner:
                     max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, context_lens=None, block_tables=block_tables)
         return input_ids, positions
     
-    def prepare_decode(self, seqs: list[Sequence], verify: bool = False): 
+    def prepare_decode(self, seqs: list[Sequence], verify: bool = False, lookahead: int | None = None):
+        k = self.config.speculate_k if lookahead is None else lookahead
         input_ids, positions, slot_mapping, context_lens = \
-            prepare_decode_tensors_from_seqs(seqs, self.block_size, self.is_draft, verify, self.config.speculate_k if verify else -1)
+            prepare_decode_tensors_from_seqs(seqs, self.block_size, self.is_draft, verify, k if verify else -1)
 
         
         block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft) # if verify, set cu_seqlens_q as well
@@ -526,10 +527,10 @@ class ModelRunner:
         if verify: ### what path does glue decode take? trace it. 
             # this had [not draft and draft_async] condn before
             cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=self.device)
-            seqlen_q = torch.full((len(seqs),), self.config.speculate_k + 1, dtype=torch.int32, device=self.device)
+            seqlen_q = torch.full((len(seqs),), k + 1, dtype=torch.int32, device=self.device)
             cu_seqlens_q[1:] = torch.cumsum(seqlen_q, dim=0)
             set_context(is_prefill=False, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None, 
-                       max_seqlen_q=self.config.speculate_k + 1, max_seqlen_k=0,
+                       max_seqlen_q=k + 1, max_seqlen_k=0,
                        slot_mapping=slot_mapping, context_lens=context_lens, 
                        block_tables=block_tables) 
         else: # sq_decode path, draft (sync spec) or target (normal)
@@ -538,6 +539,22 @@ class ModelRunner:
                        context_lens=context_lens, block_tables=block_tables)
         
         return input_ids, positions
+
+    @torch.inference_mode()
+    def run_dflash_target(self, seqs, is_prefill: bool, lookahead: int = 0):
+        """Native Qwen3 target forward with exact DFlash conditioning features."""
+        if not self.config.use_dflash or self.is_draft:
+            raise RuntimeError("run_dflash_target requires the DFlash target configuration")
+        try:
+            if is_prefill:
+                input_ids, positions = self.prepare_prefill(seqs)
+            else:
+                input_ids, positions = self.prepare_decode(seqs, verify=lookahead > 0, lookahead=lookahead)
+            hidden, features = self.model(input_ids, positions, target_layer_ids=self.config.dflash_target_layers)
+            logits = self.model.compute_logits(hidden, last_only=is_prefill)
+            return logits, features
+        finally:
+            reset_context()
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []

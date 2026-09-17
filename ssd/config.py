@@ -33,6 +33,10 @@ class Config:
     sampler_x: float | None = None 
     jit_speculate: bool = False 
 
+    # Stage 1: original DFlash, synchronous single-request Qwen3 baseline.
+    use_dflash: bool = False
+    dflash_target_layers: list[int] | None = None
+
     # eagle3
     use_eagle: bool = False 
     eagle_layers: list[int] | None = None   
@@ -49,7 +53,14 @@ class Config:
         return (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
 
     def __post_init__(self):
-        model = self.model 
+        if self.use_dflash:
+            if self.draft_async or self.use_eagle or self.num_gpus != 1 or self.max_num_seqs != 1:
+                raise ValueError("DFlash baseline requires synchronous mode, one GPU, max_num_seqs=1, use_eagle=False")
+            if self.sampler_x is not None or self.speculate_k < 1:
+                raise ValueError("DFlash requires speculate_k >= 1 and no sampler_x rescaling")
+            self.speculate = True
+            self.enforce_eager = True
+        model = self.model
         assert os.path.isdir(model)
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
@@ -69,6 +80,9 @@ class Config:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
                 
+        if self.use_dflash:
+            from ssd.engine.dflash_support import validate_dflash_config
+            self.dflash_target_layers = validate_dflash_config(self.hf_config, self.draft_hf_config)
         if self.use_eagle:
             if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers

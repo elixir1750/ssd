@@ -50,10 +50,15 @@ class LLMEngine:
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
             
         # Check that target and draft are from the same family
-        if config.speculate:
+        if config.speculate and not config.use_dflash:
             target_family = infer_model_family(config.model)
             draft_family = infer_model_family(config.draft)
             assert target_family == draft_family, f"ERROR: target model family and draft model family must match"
+
+        self.dflash_runner = None
+        if config.use_dflash:
+            from ssd.engine.dflash_sync import DFlashRunner
+            self.dflash_runner = DFlashRunner(config)
 
         self.ps = []
         self.events = []
@@ -107,7 +112,7 @@ class LLMEngine:
             self.prev_allocated_blocks = None
             self.prev_blocks_per_fork = None
 
-        if config.speculate and not config.draft_async:
+        if config.speculate and not config.draft_async and not config.use_dflash:
             # keep it colocated on rank 0, process/dist agnostic in this case
             self.draft_runner = DraftRunner(config)
             self.draft_cfg = self.draft_runner.draft_cfg
@@ -115,7 +120,12 @@ class LLMEngine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config, draft_cfg=self.draft_cfg if config.speculate else None)
+        if config.use_dflash:
+            from ssd.engine.dflash_sync import DFlashScheduler
+            self.dflash_runner.bind_target(self.model_runner.model)
+            self.scheduler = DFlashScheduler(config)
+        else:
+            self.scheduler = Scheduler(config, draft_cfg=self.draft_cfg if config.speculate else None)
         assert config.max_model_len == self.scheduler.max_model_len
 
         print(f"[LLMEngine] finished llm_engine init", flush=True)
@@ -128,6 +138,10 @@ class LLMEngine:
         if getattr(self, "_exiting", False):
             return
         self._exiting = True
+        if self.config.use_dflash:
+            # This stage has no child processes or distributed groups.
+            self.dflash_runner.reset()
+            return
         # 1) If async, tell draft to quit before tearing down anything
         try:
             if self.config.speculate and self.config.draft_async:
@@ -186,6 +200,9 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if self.config.use_dflash:
+            from ssd.engine.dflash_support import validate_request
+            validate_request(prompt, sampling_params, self.config.max_model_len)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
@@ -270,6 +287,9 @@ class LLMEngine:
                         f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
 
     def create_inference_step(self, config: Config) -> InferenceStep:
+        if config.use_dflash:
+            from ssd.engine.dflash_sync import DFlashStep
+            return DFlashStep(self.scheduler, self.model_runner, self.dflash_runner, METRICS)
         if config.speculate:
             if config.draft_async:
                 speculator = SpeculatorAsync(
