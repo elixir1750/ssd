@@ -218,4 +218,31 @@ latencies; output differences between modes are reported explicitly. A passed co
 serial/async parity for those cases, not native AR or HF equivalence.
 
 Local validation for this implementation: 23 CPU tests passed, including the
-optional pinned-upstream parity test. GPU validation is pending.
+optional pinned-upstream parity test. The GPU result below covers the two-GPU path.
+
+## A800 validation and throughput (2026-09-17)
+
+Job `ssd-fdflash-dual-0917-1` ran commit `d70f111` with Qwen3-8B and
+Qwen3-8B-DFlash-b16 on two A800 80GB GPUs, block size 8, one request and a
+512-token context. All 45 functional requests completed; all five serial/async
+greedy comparisons passed and the draft worker exited cleanly.
+
+| Mode | GPUs used | Aggregate generated token/s |
+| --- | ---: | ---: |
+| Ordinary DFlash | 1 | 70.09 |
+| Serial all-position FDFlash | 1 | 24.99 |
+| Async all-position FDFlash | 2 | 49.40 |
+
+Three fixed prompts each generated exactly 128 tokens with greedy sampling and
+`ignore_eos=True`. Each prompt had one full-length warmup and three timed repeats.
+Aggregate throughput is total tokens divided by the sum of median request
+latencies, including prefill, transfers, drafting, verification, sampling and
+reset, but excluding initialization and explicit warmups. All three modes had
+identical measured output tokens. This is a small workload comparison, not a
+broad serving benchmark or native AR/HF equivalence claim.
+
+Async FDFlash was 1.98x serial FDFlash, but only 0.705x ordinary single-GPU
+DFlash. Mean committed tokens per round fell from 2.10/3.20/8.00 in ordinary
+DFlash to 1.51/2.37/5.33 in both FDFlash modes. Async branch preparation still
+left 0.63/0.41/0.19 seconds of residual wait per request. Acceptance quality
+and branch preparation cost remain the main optimization targets.
