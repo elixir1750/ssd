@@ -35,6 +35,7 @@ class Config:
 
     # Stage 1: original DFlash, synchronous single-request Qwen3 baseline.
     use_dflash: bool = False
+    dflash_all_positions: bool = False
     dflash_target_layers: list[int] | None = None
 
     # eagle3
@@ -53,6 +54,8 @@ class Config:
         return (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
 
     def __post_init__(self):
+        if self.dflash_all_positions and not self.use_dflash:
+            raise ValueError("dflash_all_positions requires use_dflash=True")
         if self.use_dflash:
             if self.draft_async or self.use_eagle or self.num_gpus != 1 or self.max_num_seqs != 1:
                 raise ValueError("DFlash baseline requires synchronous mode, one GPU, max_num_seqs=1, use_eagle=False")

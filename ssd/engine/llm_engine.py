@@ -33,6 +33,7 @@ METRICS = {
     "decode_total_tokens": 0,
     "target_step_times": [],
     "target_verify_times": [],
+    "dflash_position_rounds": [],
 }
 
 
@@ -58,7 +59,11 @@ class LLMEngine:
         self.dflash_runner = None
         if config.use_dflash:
             from ssd.engine.dflash_sync import DFlashRunner
-            self.dflash_runner = DFlashRunner(config)
+            if config.dflash_all_positions:
+                from ssd.engine.dflash_positions import DFlashPositionsRunner
+                self.dflash_runner = DFlashPositionsRunner(config)
+            else:
+                self.dflash_runner = DFlashRunner(config)
 
         self.ps = []
         self.events = []

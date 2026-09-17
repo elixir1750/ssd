@@ -1,5 +1,9 @@
 # Standard DFlash baseline in SSD
 
+For the optional next-stage experiment, see [DFlash for every acceptance
+position](dflash-positions.md), enabled with `--all-positions`. The default mode
+described below remains the standard synchronous baseline.
+
 This stage connects **original DFlash** to SSD's native dense Qwen3 target.
 It performs the normal synchronous cycle: target features → one DFlash forward
 → target verification → accepted target features. There is no SSD lookahead

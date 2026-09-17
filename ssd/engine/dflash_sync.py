@@ -169,6 +169,12 @@ class DFlashStep:
         else:
             candidates = torch.empty(0, dtype=torch.long, device=self.draft.device)
             q = torch.empty(0, self.draft.model.config.vocab_size, device=self.draft.device)
+        round_record = None
+        if k and hasattr(self.draft, "prepare_branches"):
+            # Intentionally before target verification: branch inputs cannot
+            # include this round's accepted length, bonus, or target features.
+            self.draft.prepare_branches(seq, candidates)
+            round_record = dict(self.draft.round_record)
         anchor = seq.recovery_token_id
         old_len, old_last = seq.num_tokens, seq.last_token
         try:
@@ -191,4 +197,8 @@ class DFlashStep:
         else:
             self.draft.update(features, accepted)
         self.metrics["accepted_suffix_lens_with_recovery"].append(produced)
+        if round_record is not None:
+            round_record.update(accepted=accepted, emitted_tokens=produced,
+                                selected_next_pos=None if seq.is_finished else accepted)
+            self.metrics.setdefault("dflash_position_rounds", []).append(round_record)
         return produced

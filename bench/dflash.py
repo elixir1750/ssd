@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--draft-temperature", type=float)
+    parser.add_argument("--all-positions", action="store_true",
+                        help="Prepare next DFlash candidates for every possible acceptance position before verification (serial reference)")
     parser.add_argument("--memory-utilization", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check-reference", action="store_true",
@@ -75,10 +77,12 @@ def main():
 
     torch.manual_seed(args.seed)
     engine = LLM(args.target, draft=args.draft, use_dflash=True,
+                 dflash_all_positions=args.all_positions,
                  speculate_k=args.block_size - 1, num_gpus=1, max_num_seqs=1,
                  max_model_len=limit, max_num_batched_tokens=max(16384, limit),
                  gpu_memory_utilization=args.memory_utilization)
-    report = {"mode": "synchronous_dflash", "target": args.target, "draft": args.draft,
+    report = {"mode": "dflash_all_positions_serial" if args.all_positions else "synchronous_dflash",
+              "target": args.target, "draft": args.draft,
               "block_size": args.block_size, "target_layer_ids": layer_ids,
               "torch": torch.__version__}
     try:
@@ -101,6 +105,10 @@ def main():
         torch.cuda.synchronize()
         report["outputs"] = outputs
         report["metrics"] = metrics
+        if args.all_positions:
+            from ssd.engine.dflash_positions import summarize_position_rounds
+            report["position_summary"] = summarize_position_rounds(metrics["dflash_position_rounds"])
+            report["execution_note"] = "Serial all-position preparation; timings are not asynchronous SSD speedups."
         if reference is not None:
             report["greedy_matches_hf"] = outputs[0]["token_ids"] == reference["tokens"]
             report["reference_tokens"] = reference["tokens"]
